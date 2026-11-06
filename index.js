@@ -22,7 +22,7 @@ const {
   NoSubscriberBehavior,
 } = require('@discordjs/voice');
 
-const { DISCORD_TOKEN, GUILD_ID, YTDLP_PATH = 'yt-dlp' } = process.env;
+const { MTU2ODI5OTg0NDA0NzYwMTcxNw.GIGOO5.rj1QEw_tJ3vkOv77Z5m5VldJ-gdqgnl4Q7e568, 1568270767475658863, YTDLP_PATH = 'yt-dlp' } = process.env;
 if (!DISCORD_TOKEN) {
   console.error('Missing DISCORD_TOKEN in .env');
   process.exit(1);
