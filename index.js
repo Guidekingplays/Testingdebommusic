@@ -1,5 +1,7 @@
 require('dotenv').config();
 const { spawn } = require('node:child_process');
+const fs = require('node:fs');
+const ffmpegPath = require('ffmpeg-static');
 const {
   Client,
   GatewayIntentBits,
@@ -10,6 +12,7 @@ const {
   Routes,
   EmbedBuilder,
   MessageFlags,
+  Events,
 } = require('discord.js');
 const {
   joinVoiceChannel,
@@ -23,9 +26,7 @@ const {
 } = require('@discordjs/voice');
 
 const { DISCORD_TOKEN, GUILD_ID, YTDLP_PATH = 'yt-dlp' } = process.env;
-// Optional: YouTube cookies (base64 of a Netscape cookies.txt) to get past
-// "confirm you're not a bot" blocks on datacenter hosts like Railway.
-const fs = require('node:fs');
+
 const ytExtraArgs = [];
 if (process.env.YT_COOKIES_B64) {
   try {
@@ -37,7 +38,6 @@ if (process.env.YT_COOKIES_B64) {
   }
 }
 
-// Optional: route yt-dlp through a proxy (e.g. a residential proxy) to avoid IP blocks.
 if (process.env.YT_PROXY) ytExtraArgs.push('--proxy', process.env.YT_PROXY);
 
 if (!DISCORD_TOKEN) {
@@ -45,20 +45,14 @@ if (!DISCORD_TOKEN) {
   process.exit(1);
 }
 
-/* ------------------------------------------------------------------ */
-/* Client + Do Not Disturb presence                                    */
-/* ------------------------------------------------------------------ */
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
   presence: {
-    status: PresenceUpdateStatus.DoNotDisturb, // red "Do Not Disturb" dot
+    status: PresenceUpdateStatus.DoNotDisturb,
     activities: [{ name: '/play', type: ActivityType.Listening }],
   },
 });
 
-/* ------------------------------------------------------------------ */
-/* Slash command definitions                                           */
-/* ------------------------------------------------------------------ */
 const commands = [
   new SlashCommandBuilder()
     .setName('play')
@@ -97,23 +91,17 @@ const commands = [
 
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
-  const appId = client.application.id;
+  const appId = client.user.id;
   if (GUILD_ID) {
-    // Guild commands update instantly - best for a single server
     await rest.put(Routes.applicationGuildCommands(appId, GUILD_ID), { body: commands });
     console.log(`Registered ${commands.length} slash commands in guild ${GUILD_ID}`);
   } else {
-    // Global commands can take up to an hour to appear
     await rest.put(Routes.applicationCommands(appId), { body: commands });
     console.log(`Registered ${commands.length} global slash commands`);
   }
 }
 
-/* ------------------------------------------------------------------ */
-/* Helpers                                                             */
-/* ------------------------------------------------------------------ */
-const queues = new Map(); // guildId -> guild queue
-
+const queues = new Map();
 const isUrl = (s) => /^https?:\/\//i.test(s);
 
 function fmtDuration(sec) {
@@ -164,8 +152,6 @@ function isYouTubeUrl(u) {
   }
 }
 
-// YouTube's oEmbed endpoint returns a video's title without the "not a bot" check,
-// so it usually still works from datacenter IPs like Railway.
 async function youtubeMetaViaOembed(url) {
   const u = new URL(url);
   let id = u.hostname === 'youtu.be' ? u.pathname.slice(1) : u.searchParams.get('v');
@@ -181,8 +167,6 @@ async function youtubeMetaViaOembed(url) {
   return { title: j.title, author: (j.author_name || '').replace(/ - Topic$/i, '') };
 }
 
-// URLs are used as-is. Searches try YouTube first, then SoundCloud as a fallback.
-// If a YouTube link is blocked, find the same song on SoundCloud instead.
 async function resolveTrack(query) {
   const targets = isUrl(query) ? [query] : [`ytsearch1:${query}`, `scsearch1:${query}`];
   let lastErr;
@@ -190,7 +174,6 @@ async function resolveTrack(query) {
     try {
       return await runYtDlpInfo(target);
     } catch (e) {
-      console.error(`yt-dlp lookup failed for "${target}":\n${e.message}`);
       lastErr = e;
     }
   }
@@ -201,7 +184,6 @@ async function resolveTrack(query) {
       const search = author && !title.toLowerCase().includes(author.toLowerCase())
         ? `${title} ${author}`
         : title;
-      console.log(`YouTube blocked - searching SoundCloud for "${search}"`);
       const track = await runYtDlpInfo(`scsearch1:${search}`);
       track.note = 'YouTube blocked this server, so this is a SoundCloud match.';
       return track;
@@ -226,9 +208,6 @@ function trackEmbed(title, track, extra) {
   return e;
 }
 
-/* ------------------------------------------------------------------ */
-/* Per-guild queue / player                                            */
-/* ------------------------------------------------------------------ */
 async function createGuildQueue(interaction, voiceChannel) {
   const connection = joinVoiceChannel({
     channelId: voiceChannel.id,
@@ -240,7 +219,6 @@ async function createGuildQueue(interaction, voiceChannel) {
   try {
     await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
   } catch (err) {
-    console.error('Voice connection failed (state: %s):', connection.state.status, err);
     connection.destroy();
     throw new Error('Could not join the voice channel.');
   }
@@ -259,7 +237,8 @@ async function createGuildQueue(interaction, voiceChannel) {
     queue: [],
     current: null,
     resource: null,
-    proc: null,
+    ytProc: null,
+    ffmpegProc: null,
     volume: 50,
     loop: 'off',
     forceNext: false,
@@ -274,7 +253,6 @@ async function createGuildQueue(interaction, voiceChannel) {
 
   connection.on(VoiceConnectionStatus.Disconnected, async () => {
     try {
-      // Moved channels / brief network blip -> it will reconnect on its own
       await Promise.race([
         entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
         entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
@@ -289,9 +267,13 @@ async function createGuildQueue(interaction, voiceChannel) {
 }
 
 function killProc(gq) {
-  if (gq.proc) {
-    gq.proc.kill('SIGKILL');
-    gq.proc = null;
+  if (gq.ytProc) {
+    gq.ytProc.kill('SIGKILL');
+    gq.ytProc = null;
+  }
+  if (gq.ffmpegProc) {
+    gq.ffmpegProc.kill('SIGKILL');
+    gq.ffmpegProc = null;
   }
 }
 
@@ -320,7 +302,6 @@ function playNext(gq, announce) {
 
   if (!next) {
     gq.current = null;
-    // Leave after 2 minutes of nothing playing
     gq.leaveTimer = setTimeout(() => {
       gq.textChannel?.send('Queue finished - leaving the voice channel.').catch(() => {});
       destroyQueue(gq.guildId);
@@ -330,17 +311,39 @@ function playNext(gq, announce) {
 
   gq.current = next;
 
-  const proc = spawn(
+  // 1. Spawn yt-dlp to output raw audio
+  const ytProc = spawn(
     YTDLP_PATH,
     ['-f', 'bestaudio/best', '-o', '-', '-q', '--no-warnings', '--no-playlist', ...ytExtraArgs, next.url],
     { stdio: ['ignore', 'pipe', 'pipe'] },
   );
-  proc.stderr.on('data', (d) => console.error('yt-dlp stream:', d.toString().trim()));
-  proc.on('error', (e) => console.error('yt-dlp error:', e.message));
-  gq.proc = proc;
+  gq.ytProc = ytProc;
 
-  const resource = createAudioResource(proc.stdout, {
-    inputType: StreamType.Arbitrary,
+  // 2. Spawn FFmpeg to convert stream to 48kHz Stereo 16-bit PCM for Discord
+  const ffmpegBin = ffmpegPath || 'ffmpeg';
+  const ffmpegProc = spawn(
+    ffmpegBin,
+    [
+      '-analyzeduration', '0',
+      '-loglevel', '0',
+      '-i', 'pipe:0',
+      '-f', 's16le',
+      '-ar', '48000',
+      '-ac', '2',
+      'pipe:1',
+    ],
+    { stdio: ['pipe', 'pipe', 'ignore'] },
+  );
+  gq.ffmpegProc = ffmpegProc;
+
+  ytProc.stdout.pipe(ffmpegProc.stdin);
+
+  ytProc.on('error', (e) => console.error('yt-dlp error:', e.message));
+  ffmpegProc.on('error', (e) => console.error('ffmpeg error:', e.message));
+
+  // 3. Create audio resource from FFmpeg's raw PCM stream
+  const resource = createAudioResource(ffmpegProc.stdout, {
+    inputType: StreamType.Raw,
     inlineVolume: true,
   });
   resource.volume.setVolume(gq.volume / 100);
@@ -352,9 +355,6 @@ function playNext(gq, announce) {
   }
 }
 
-/* ------------------------------------------------------------------ */
-/* Command handlers                                                    */
-/* ------------------------------------------------------------------ */
 const ephemeral = (content) => ({ content, flags: MessageFlags.Ephemeral });
 
 async function handlePlay(interaction) {
@@ -403,26 +403,21 @@ async function handlePlay(interaction) {
 
 const handlers = {
   play: handlePlay,
-
   async skip(i, gq) {
     gq.forceNext = true;
-    gq.player.stop(true); // triggers Idle -> next track
+    gq.player.stop(true);
     return i.reply('Skipped.');
   },
-
   async pause(i, gq) {
     return i.reply(gq.player.pause() ? 'Paused.' : ephemeral('Nothing to pause.'));
   },
-
   async resume(i, gq) {
     return i.reply(gq.player.unpause() ? 'Resumed.' : ephemeral('Nothing to resume.'));
   },
-
   async stop(i, gq) {
     destroyQueue(gq.guildId);
     return i.reply('Stopped and disconnected.');
   },
-
   async queue(i, gq) {
     if (!gq.current && !gq.queue.length) return i.reply(ephemeral('The queue is empty.'));
     const lines = gq.queue
@@ -439,7 +434,6 @@ const handlers = {
       .setFooter({ text: `Loop: ${gq.loop} | Volume: ${gq.volume}%` });
     return i.reply({ embeds: [embed] });
   },
-
   async nowplaying(i, gq) {
     if (!gq.current) return i.reply(ephemeral('Nothing is playing.'));
     const elapsed = Math.floor((gq.resource?.playbackDuration ?? 0) / 1000);
@@ -453,7 +447,6 @@ const handlers = {
       ],
     });
   },
-
   async shuffle(i, gq) {
     if (gq.queue.length < 2) return i.reply(ephemeral('Not enough songs in the queue to shuffle.'));
     for (let n = gq.queue.length - 1; n > 0; n--) {
@@ -462,25 +455,19 @@ const handlers = {
     }
     return i.reply('Queue shuffled.');
   },
-
   async volume(i, gq) {
     gq.volume = i.options.getInteger('level', true);
     gq.resource?.volume?.setVolume(gq.volume / 100);
     return i.reply(`Volume set to **${gq.volume}%**.`);
   },
-
   async loop(i, gq) {
     gq.loop = i.options.getString('mode', true);
     return i.reply(`Loop mode: **${gq.loop}**.`);
   },
 };
 
-/* ------------------------------------------------------------------ */
-/* Events                                                              */
-/* ------------------------------------------------------------------ */
-client.once('clientReady', async () => {
+client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
-  // Re-assert DND in case the gateway reset it
   client.user.setPresence({
     status: 'dnd',
     activities: [{ name: '/play', type: ActivityType.Listening }],
@@ -492,7 +479,7 @@ client.once('clientReady', async () => {
   }
 });
 
-client.on('interactionCreate', async (interaction) => {
+client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand() || !interaction.inGuild()) return;
 
   const handler = handlers[interaction.commandName];
@@ -515,8 +502,7 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-// Clean up if everyone leaves or the bot is kicked from voice
-client.on('voiceStateUpdate', (oldState, newState) => {
+client.on(Events.VoiceStateUpdate, (oldState, newState) => {
   const gq = queues.get(oldState.guild.id);
   if (!gq) return;
   if (oldState.id === client.user.id && !newState.channelId) return destroyQueue(gq.guildId);
