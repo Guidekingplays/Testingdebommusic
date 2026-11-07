@@ -168,7 +168,7 @@ async function youtubeMetaViaOembed(url) {
 }
 
 async function resolveTrack(query) {
-  const targets = isUrl(query) ? [query] : [`ytsearch1:${query}`, `scsearch1:${query}`];
+  const targets = isUrl(query) ? [query] : [`scsearch1:${query}`, `ytsearch1:${query}`];
   let lastErr;
   for (const target of targets) {
     try {
