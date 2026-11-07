@@ -28,12 +28,12 @@ const {
 const { DISCORD_TOKEN, GUILD_ID, YTDLP_PATH = 'yt-dlp' } = process.env;
 
 if (!DISCORD_TOKEN) {
-  console.error('Missing DISCORD_TOKEN in environment variables.');
+  console.error('Missing DISCORD_TOKEN in Railway Variables.');
   process.exit(1);
 }
 
 /* ------------------------------------------------------------------ */
-/* YouTube & Network Extractor Arguments                              */
+/* YouTube & Network Arguments                                         */
 /* ------------------------------------------------------------------ */
 const ytExtraArgs = [
   '--force-ipv4',
@@ -46,7 +46,7 @@ if (process.env.YT_COOKIES_B64) {
   try {
     fs.writeFileSync('/tmp/yt-cookies.txt', Buffer.from(process.env.YT_COOKIES_B64, 'base64'));
     ytExtraArgs.push('--cookies', '/tmp/yt-cookies.txt');
-    console.log('Loaded YouTube cookies from YT_COOKIES_B64');
+    console.log('Using YouTube cookies from YT_COOKIES_B64');
   } catch (e) {
     console.error('Could not write cookies file:', e.message);
   }
@@ -57,7 +57,7 @@ if (process.env.YT_PROXY) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Client Initialization                                              */
+/* Discord Client Initialization                                      */
 /* ------------------------------------------------------------------ */
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
@@ -68,7 +68,7 @@ const client = new Client({
 });
 
 /* ------------------------------------------------------------------ */
-/* Slash Commands Definition                                          */
+/* Slash Command Definitions                                          */
 /* ------------------------------------------------------------------ */
 const commands = [
   new SlashCommandBuilder()
@@ -119,7 +119,7 @@ async function registerCommands() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Parsers & Resolvers                                                */
+/* Helpers & Metadata Resolvers                                       */
 /* ------------------------------------------------------------------ */
 const queues = new Map();
 const isUrl = (s) => /^https?:\/\//i.test(s);
@@ -181,16 +181,35 @@ async function parseSpotifyCollection(url) {
   const titleMatch = html.match(/<meta property="og:title" content="([^"]+)"/);
   const collectionName = titleMatch ? titleMatch[1] : 'Spotify Collection';
 
-  const matches = [...html.matchAll(/dir="auto"[^>]*>([^<]+)<\/div>/g)];
-  const songs = [];
-  for (const match of matches) {
-    const name = match[1].trim();
-    if (name && !['Home', 'Search', 'Your Library', 'Spotify'].includes(name) && !songs.includes(name)) {
-      songs.push(name);
+  const trackMatches = [
+    ...html.matchAll(/<meta property="music:song" content="https:\/\/open\.spotify\.com\/track\/([A-Za-z0-9]+)"/g),
+  ];
+
+  let songs = [];
+  if (trackMatches.length > 0) {
+    for (const match of trackMatches.slice(0, 30)) {
+      try {
+        const meta = await spotifyMetaViaOembed(`https://open.spotify.com/track/${match[1]}`);
+        songs.push(meta.title);
+      } catch {}
     }
   }
 
-  return { name: collectionName, songs: songs.slice(0, 100) };
+  if (songs.length === 0) {
+    const rawMatches = [...html.matchAll(/dir="auto"[^>]*>([^<]+)<\/div>/g)];
+    for (const match of rawMatches) {
+      const name = match[1].trim();
+      if (
+        name &&
+        !['Home', 'Search', 'Your Library', 'Spotify', 'Create Playlist'].includes(name) &&
+        !songs.includes(name)
+      ) {
+        songs.push(name);
+      }
+    }
+  }
+
+  return { name: collectionName, songs: songs.slice(0, 50) };
 }
 
 async function youtubeMetaViaOembed(url) {
@@ -223,10 +242,10 @@ function runYtDlpInfo(target) {
     let err = '';
     proc.stdout.on('data', (d) => (out += d));
     proc.stderr.on('data', (d) => (err += d));
-    proc.on('error', (e) => reject(new Error(`yt-dlp spawn failure: ${e.message}`)));
+    proc.on('error', (e) => reject(new Error(`yt-dlp execution failure: ${e.message}`)));
     proc.on('close', (code) => {
       const line = out.split('\n').find((l) => l.trim().startsWith('{'));
-      if (code !== 0 || !line) return reject(new Error(err.trim() || 'No audio sources found'));
+      if (code !== 0 || !line) return reject(new Error(err.trim() || 'No audio stream available'));
       try {
         const j = JSON.parse(line);
         resolve({
@@ -265,7 +284,6 @@ async function resolveTrack(query) {
     } catch (directErr) {
       console.error(`Direct YouTube lookup blocked: ${directErr.message}`);
 
-      // Bypass IP block: grab metadata via oEmbed and resolve stream on SoundCloud
       let oembed;
       try {
         oembed = await youtubeMetaViaOembed(targetQuery);
@@ -290,7 +308,7 @@ async function resolveTrack(query) {
     }
   }
 
-  // 3. Regular Queries & Spotify Tracks (Search SoundCloud first, then YouTube)
+  // 3. Plain Queries & Spotify Titles (Search SoundCloud first to bypass datacenter IP blocks)
   const searchTargets = isUrl(targetQuery)
     ? [targetQuery]
     : [`scsearch1:${targetQuery}`, `ytsearch1:${targetQuery}`];
@@ -324,7 +342,7 @@ function trackEmbed(title, track, extra) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Voice Connection & Pipeline                                        */
+/* Voice Connection & Audio Stream Pipeline                           */
 /* ------------------------------------------------------------------ */
 async function createGuildQueue(interaction, voiceChannel) {
   const connection = joinVoiceChannel({
@@ -529,7 +547,6 @@ async function handlePlay(interaction) {
         ],
       });
 
-      // Silently resolve remaining playlist tracks in the background
       (async () => {
         for (const songTitle of collection.songs) {
           try {
@@ -546,7 +563,7 @@ async function handlePlay(interaction) {
     }
   }
 
-  // Handle Single Track (YouTube URL, Spotify Track URL, or Search Query)
+  // Handle Single Track
   let track;
   try {
     track = await resolveTrack(query);
