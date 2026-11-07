@@ -37,6 +37,9 @@ if (process.env.YT_COOKIES_B64) {
   }
 }
 
+// Optional: route yt-dlp through a proxy (e.g. a residential proxy) to avoid IP blocks.
+if (process.env.YT_PROXY) ytExtraArgs.push('--proxy', process.env.YT_PROXY);
+
 if (!DISCORD_TOKEN) {
   console.error('Missing DISCORD_TOKEN in .env');
   process.exit(1);
@@ -153,7 +156,33 @@ function runYtDlpInfo(target) {
   });
 }
 
+function isYouTubeUrl(u) {
+  try {
+    return /(^|\.)(youtube\.com|youtu\.be|youtube-nocookie\.com)$/i.test(new URL(u).hostname);
+  } catch {
+    return false;
+  }
+}
+
+// YouTube's oEmbed endpoint returns a video's title without the "not a bot" check,
+// so it usually still works from datacenter IPs like Railway.
+async function youtubeMetaViaOembed(url) {
+  const u = new URL(url);
+  let id = u.hostname === 'youtu.be' ? u.pathname.slice(1) : u.searchParams.get('v');
+  const m = u.pathname.match(/^\/(?:shorts|embed|live)\/([\w-]{6,})/);
+  if (!id && m) id = m[1];
+  const watch = id ? `https://www.youtube.com/watch?v=${id}` : url;
+  const res = await fetch(
+    `https://www.youtube.com/oembed?url=${encodeURIComponent(watch)}&format=json`,
+    { signal: AbortSignal.timeout(8000) },
+  );
+  if (!res.ok) throw new Error(`oEmbed returned ${res.status}`);
+  const j = await res.json();
+  return { title: j.title, author: (j.author_name || '').replace(/ - Topic$/i, '') };
+}
+
 // URLs are used as-is. Searches try YouTube first, then SoundCloud as a fallback.
+// If a YouTube link is blocked, find the same song on SoundCloud instead.
 async function resolveTrack(query) {
   const targets = isUrl(query) ? [query] : [`ytsearch1:${query}`, `scsearch1:${query}`];
   let lastErr;
@@ -163,6 +192,21 @@ async function resolveTrack(query) {
     } catch (e) {
       console.error(`yt-dlp lookup failed for "${target}":\n${e.message}`);
       lastErr = e;
+    }
+  }
+
+  if (isUrl(query) && isYouTubeUrl(query)) {
+    try {
+      const { title, author } = await youtubeMetaViaOembed(query);
+      const search = author && !title.toLowerCase().includes(author.toLowerCase())
+        ? `${title} ${author}`
+        : title;
+      console.log(`YouTube blocked - searching SoundCloud for "${search}"`);
+      const track = await runYtDlpInfo(`scsearch1:${search}`);
+      track.note = 'YouTube blocked this server, so this is a SoundCloud match.';
+      return track;
+    } catch (e) {
+      console.error(`SoundCloud fallback failed: ${e.message}`);
     }
   }
   throw lastErr;
@@ -348,10 +392,12 @@ async function handlePlay(interaction) {
 
   if (!gq.current) {
     playNext(gq, false);
-    return interaction.editReply({ embeds: [trackEmbed('Now playing', track)] });
+    return interaction.editReply({ embeds: [trackEmbed('Now playing', track, track.note)] });
   }
   return interaction.editReply({
-    embeds: [trackEmbed('Added to queue', track, `Position ${gq.queue.length}`)],
+    embeds: [
+      trackEmbed('Added to queue', track, `Position ${gq.queue.length}${track.note ? ' | ' + track.note : ''}`),
+    ],
   });
 }
 
