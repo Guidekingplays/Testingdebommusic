@@ -1,7 +1,7 @@
 {
   "name": "discord-music-bot",
   "version": "1.0.0",
-  "description": "Discord music bot with slash commands and Do Not Disturb status",
+  "description": "Discord music bot deployed on Railway",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
