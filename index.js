@@ -23,6 +23,20 @@ const {
 } = require('@discordjs/voice');
 
 const { DISCORD_TOKEN, GUILD_ID, YTDLP_PATH = 'yt-dlp' } = process.env;
+// Optional: YouTube cookies (base64 of a Netscape cookies.txt) to get past
+// "confirm you're not a bot" blocks on datacenter hosts like Railway.
+const fs = require('node:fs');
+const ytExtraArgs = [];
+if (process.env.YT_COOKIES_B64) {
+  try {
+    fs.writeFileSync('/tmp/yt-cookies.txt', Buffer.from(process.env.YT_COOKIES_B64, 'base64'));
+    ytExtraArgs.push('--cookies', '/tmp/yt-cookies.txt');
+    console.log('Using YouTube cookies from YT_COOKIES_B64');
+  } catch (e) {
+    console.error('Could not write cookies file:', e.message);
+  }
+}
+
 if (!DISCORD_TOKEN) {
   console.error('Missing DISCORD_TOKEN in .env');
   process.exit(1);
@@ -108,12 +122,13 @@ function fmtDuration(sec) {
   return `${h ? h + ':' : ''}${mm}:${String(s).padStart(2, '0')}`;
 }
 
-function resolveTrack(query) {
+function runYtDlpInfo(target) {
   return new Promise((resolve, reject) => {
-    const target = isUrl(query) ? query : `ytsearch1:${query}`;
-    const proc = spawn(YTDLP_PATH, ['-j', '--no-playlist', '--no-warnings', '-q', target], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    const proc = spawn(
+      YTDLP_PATH,
+      ['-j', '--no-playlist', '--no-warnings', '-q', ...ytExtraArgs, target],
+      { stdio: ['ignore', 'pipe', 'pipe'] },
+    );
     let out = '';
     let err = '';
     proc.stdout.on('data', (d) => (out += d));
@@ -136,6 +151,21 @@ function resolveTrack(query) {
       }
     });
   });
+}
+
+// URLs are used as-is. Searches try YouTube first, then SoundCloud as a fallback.
+async function resolveTrack(query) {
+  const targets = isUrl(query) ? [query] : [`ytsearch1:${query}`, `scsearch1:${query}`];
+  let lastErr;
+  for (const target of targets) {
+    try {
+      return await runYtDlpInfo(target);
+    } catch (e) {
+      console.error(`yt-dlp lookup failed for "${target}":\n${e.message}`);
+      lastErr = e;
+    }
+  }
+  throw lastErr;
 }
 
 function trackEmbed(title, track, extra) {
@@ -258,9 +288,10 @@ function playNext(gq, announce) {
 
   const proc = spawn(
     YTDLP_PATH,
-    ['-f', 'bestaudio/best', '-o', '-', '-q', '--no-warnings', '--no-playlist', next.url],
-    { stdio: ['ignore', 'pipe', 'ignore'] },
+    ['-f', 'bestaudio/best', '-o', '-', '-q', '--no-warnings', '--no-playlist', ...ytExtraArgs, next.url],
+    { stdio: ['ignore', 'pipe', 'pipe'] },
   );
+  proc.stderr.on('data', (d) => console.error('yt-dlp stream:', d.toString().trim()));
   proc.on('error', (e) => console.error('yt-dlp error:', e.message));
   gq.proc = proc;
 
