@@ -33,11 +33,11 @@ if (!DISCORD_TOKEN) {
 }
 
 /* ------------------------------------------------------------------ */
-/* YouTube & Network Extractor Arguments                              */
+/* Network & Extractor Arguments                                      */
 /* ------------------------------------------------------------------ */
-const ytExtraArgs = [
-  '--force-ipv4',
-  '--no-check-certificates',
+const baseArgs = ['--force-ipv4', '--no-check-certificates'];
+
+const ytExtractorArgs = [
   '--extractor-args',
   'youtube:player_client=tv_embedded,web_creator,mweb;player_skip=configs',
 ];
@@ -45,19 +45,27 @@ const ytExtraArgs = [
 if (process.env.YT_COOKIES_B64) {
   try {
     fs.writeFileSync('/tmp/yt-cookies.txt', Buffer.from(process.env.YT_COOKIES_B64, 'base64'));
-    ytExtraArgs.push('--cookies', '/tmp/yt-cookies.txt');
-    console.log('Loaded YouTube cookies from YT_COOKIES_B64');
+    baseArgs.push('--cookies', '/tmp/yt-cookies.txt');
+    console.log('Using cookies from YT_COOKIES_B64');
   } catch (e) {
     console.error('Could not write cookies file:', e.message);
   }
 }
 
 if (process.env.YT_PROXY) {
-  ytExtraArgs.push('--proxy', process.env.YT_PROXY);
+  baseArgs.push('--proxy', process.env.YT_PROXY);
+}
+
+function getArgsForTarget(target) {
+  // Only apply YouTube extractor configs to YouTube URLs or searches
+  if (isYouTubeUrl(target) || target.startsWith('ytsearch') || target.startsWith('ytmsearch')) {
+    return [...baseArgs, ...ytExtractorArgs];
+  }
+  return baseArgs;
 }
 
 /* ------------------------------------------------------------------ */
-/* Client Initialization                                              */
+/* Discord Client Initialization                                      */
 /* ------------------------------------------------------------------ */
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
@@ -68,7 +76,7 @@ const client = new Client({
 });
 
 /* ------------------------------------------------------------------ */
-/* Slash Commands Definition                                          */
+/* Slash Command Definitions                                          */
 /* ------------------------------------------------------------------ */
 const commands = [
   new SlashCommandBuilder()
@@ -78,6 +86,12 @@ const commands = [
       o.setName('query').setDescription('Song name, YouTube URL, or Spotify URL').setRequired(true),
     ),
   new SlashCommandBuilder().setName('skip').setDescription('Skip the current song'),
+  new SlashCommandBuilder()
+    .setName('skipto')
+    .setDescription('Skip directly to a specific track number in the queue')
+    .addIntegerOption((o) =>
+      o.setName('position').setDescription('Track position number').setMinValue(1).setRequired(true),
+    ),
   new SlashCommandBuilder().setName('pause').setDescription('Pause playback'),
   new SlashCommandBuilder().setName('resume').setDescription('Resume playback'),
   new SlashCommandBuilder().setName('stop').setDescription('Stop playback, clear queue and leave'),
@@ -119,7 +133,7 @@ async function registerCommands() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Parsers & Resolvers                                                */
+/* Helpers & Metadata Resolvers                                       */
 /* ------------------------------------------------------------------ */
 const queues = new Map();
 const isUrl = (s) => /^https?:\/\//i.test(s);
@@ -181,16 +195,35 @@ async function parseSpotifyCollection(url) {
   const titleMatch = html.match(/<meta property="og:title" content="([^"]+)"/);
   const collectionName = titleMatch ? titleMatch[1] : 'Spotify Collection';
 
-  const matches = [...html.matchAll(/dir="auto"[^>]*>([^<]+)<\/div>/g)];
-  const songs = [];
-  for (const match of matches) {
-    const name = match[1].trim();
-    if (name && !['Home', 'Search', 'Your Library', 'Spotify'].includes(name) && !songs.includes(name)) {
-      songs.push(name);
+  const trackMatches = [
+    ...html.matchAll(/<meta property="music:song" content="https:\/\/open\.spotify\.com\/track\/([A-Za-z0-9]+)"/g),
+  ];
+
+  let songs = [];
+  if (trackMatches.length > 0) {
+    for (const match of trackMatches.slice(0, 30)) {
+      try {
+        const meta = await spotifyMetaViaOembed(`https://open.spotify.com/track/${match[1]}`);
+        songs.push(meta.title);
+      } catch {}
     }
   }
 
-  return { name: collectionName, songs: songs.slice(0, 100) };
+  if (songs.length === 0) {
+    const rawMatches = [...html.matchAll(/dir="auto"[^>]*>([^<]+)<\/div>/g)];
+    for (const match of rawMatches) {
+      const name = match[1].trim();
+      if (
+        name &&
+        !['Home', 'Search', 'Your Library', 'Spotify', 'Create Playlist'].includes(name) &&
+        !songs.includes(name)
+      ) {
+        songs.push(name);
+      }
+    }
+  }
+
+  return { name: collectionName, songs: songs.slice(0, 50) };
 }
 
 async function youtubeMetaViaOembed(url) {
@@ -214,19 +247,17 @@ async function youtubeMetaViaOembed(url) {
 
 function runYtDlpInfo(target) {
   return new Promise((resolve, reject) => {
-    const proc = spawn(
-      YTDLP_PATH,
-      ['-j', '--no-playlist', '--no-warnings', '-q', ...ytExtraArgs, target],
-      { stdio: ['ignore', 'pipe', 'pipe'] },
-    );
+    const args = ['-j', '--no-playlist', '--no-warnings', '-q', ...getArgsForTarget(target), target];
+    const proc = spawn(YTDLP_PATH, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+
     let out = '';
     let err = '';
     proc.stdout.on('data', (d) => (out += d));
     proc.stderr.on('data', (d) => (err += d));
-    proc.on('error', (e) => reject(new Error(`yt-dlp spawn failure: ${e.message}`)));
+    proc.on('error', (e) => reject(new Error(`yt-dlp execution failure: ${e.message}`)));
     proc.on('close', (code) => {
       const line = out.split('\n').find((l) => l.trim().startsWith('{'));
-      if (code !== 0 || !line) return reject(new Error(err.trim() || 'No audio sources found'));
+      if (code !== 0 || !line) return reject(new Error(err.trim() || 'No audio stream available'));
       try {
         const j = JSON.parse(line);
         resolve({
@@ -260,12 +291,13 @@ async function resolveTrack(query) {
 
   // 2. Direct YouTube Links
   if (isUrl(targetQuery) && isYouTubeUrl(targetQuery)) {
+    // Attempt direct extraction first
     try {
       return await runYtDlpInfo(targetQuery);
     } catch (directErr) {
       console.error(`Direct YouTube lookup blocked: ${directErr.message}`);
 
-      // Bypass IP block: grab metadata via oEmbed and resolve stream on SoundCloud
+      // Bypass bot wall: Fetch video title via oEmbed
       let oembed;
       try {
         oembed = await youtubeMetaViaOembed(targetQuery);
@@ -274,26 +306,32 @@ async function resolveTrack(query) {
       }
 
       const stripped = cleanTitle(oembed.title);
-      const attempts = [oembed.title, stripped, `${stripped} ${oembed.author}`.trim()];
+      // Try YouTube Music, SoundCloud, and cleaned search terms
+      const fallbackTargets = [
+        `ytmsearch1:${stripped}`,
+        `scsearch1:${stripped}`,
+        `scsearch1:${oembed.title}`,
+        `scsearch1:${stripped} ${oembed.author}`.trim(),
+      ];
 
-      for (const term of attempts) {
-        if (!term) continue;
+      for (const target of fallbackTargets) {
         try {
-          const track = await runYtDlpInfo(`scsearch1:${term}`);
-          track.title = oembed.title;
+          const track = await runYtDlpInfo(target);
+          track.title = oembed.title; // Keep original video title
           track.thumbnail = oembed.thumbnail || track.thumbnail;
-          track.note = 'Resolved via audio mirror.';
+          track.note = target.startsWith('ytmsearch') ? 'Resolved via YouTube Music.' : 'Resolved via audio mirror.';
           return track;
         } catch {}
       }
-      throw new Error('YouTube is blocked on this datacenter IP and no fallback source was found.');
+
+      throw new Error('This track could not be played due to host IP restrictions.');
     }
   }
 
-  // 3. Regular Queries & Spotify Tracks (Search SoundCloud first, then YouTube)
+  // 3. Plain Queries & Spotify Titles: Chain SoundCloud -> YouTube Music -> YouTube
   const searchTargets = isUrl(targetQuery)
     ? [targetQuery]
-    : [`scsearch1:${targetQuery}`, `ytsearch1:${targetQuery}`];
+    : [`scsearch1:${targetQuery}`, `ytmsearch1:${targetQuery}`, `ytsearch1:${targetQuery}`];
 
   let lastErr;
   for (const target of searchTargets) {
@@ -324,7 +362,7 @@ function trackEmbed(title, track, extra) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Voice Connection & Pipeline                                        */
+/* Voice Connection & Audio Stream Pipeline                           */
 /* ------------------------------------------------------------------ */
 async function createGuildQueue(interaction, voiceChannel) {
   const connection = joinVoiceChannel({
@@ -386,11 +424,11 @@ async function createGuildQueue(interaction, voiceChannel) {
 
 function killProc(gq) {
   if (gq.ytProc) {
-    gq.ytProc.kill('SIGKILL');
+    try { gq.ytProc.kill('SIGKILL'); } catch {}
     gq.ytProc = null;
   }
   if (gq.ffmpegProc) {
-    gq.ffmpegProc.kill('SIGKILL');
+    try { gq.ffmpegProc.kill('SIGKILL'); } catch {}
     gq.ffmpegProc = null;
   }
 }
@@ -415,7 +453,9 @@ function playNext(gq, announce) {
   if (gq.loop === 'track' && gq.current && !gq.forceNext) {
     next = gq.current;
   } else {
-    if (gq.loop === 'queue' && gq.current) gq.queue.push(gq.current);
+    if (gq.loop === 'queue' && gq.current && !gq.forceNext) {
+      gq.queue.push(gq.current);
+    }
     next = gq.queue.shift();
   }
   gq.forceNext = false;
@@ -423,7 +463,7 @@ function playNext(gq, announce) {
   if (!next) {
     gq.current = null;
     gq.leaveTimer = setTimeout(() => {
-      gq.textChannel?.send('Queue finished. Disconnecting from voice.').catch(() => {});
+      gq.textChannel?.send('Queue finished. Leaving the voice channel.').catch(() => {});
       destroyQueue(gq.guildId);
     }, 120_000);
     return;
@@ -439,7 +479,7 @@ function playNext(gq, announce) {
       '-q',
       '--no-warnings',
       '--no-playlist',
-      ...ytExtraArgs,
+      ...getArgsForTarget(next.url),
       next.url,
     ],
     { stdio: ['ignore', 'pipe', 'pipe'] },
@@ -483,26 +523,25 @@ function playNext(gq, announce) {
 /* ------------------------------------------------------------------ */
 /* Slash Command Handlers                                             */
 /* ------------------------------------------------------------------ */
-const ephemeral = (content) => ({ content, flags: MessageFlags.Ephemeral });
-
 async function handlePlay(interaction) {
   const voiceChannel = interaction.member.voice?.channel;
-  if (!voiceChannel) return interaction.reply(ephemeral('Join a voice channel first.'));
+  if (!voiceChannel) {
+    return interaction.editReply('You must join a voice channel first.');
+  }
 
   const perms = voiceChannel.permissionsFor(interaction.guild.members.me);
   if (!perms?.has(['ViewChannel', 'Connect', 'Speak'])) {
-    return interaction.reply(ephemeral('I need permissions to View, Connect, and Speak in that channel.'));
+    return interaction.editReply('I need View, Connect, and Speak permissions in that voice channel.');
   }
 
   let gq = queues.get(interaction.guildId);
   if (gq && gq.channelId !== voiceChannel.id) {
-    return interaction.reply(ephemeral("I'm already playing in another voice channel."));
+    return interaction.editReply("I'm already playing in another voice channel.");
   }
 
-  await interaction.deferReply();
   const query = interaction.options.getString('query', true);
 
-  // Handle Spotify Playlist or Album
+  // Spotify Playlist / Album
   if (isUrl(query) && isSpotifyUrl(query) && (query.includes('/playlist/') || query.includes('/album/'))) {
     try {
       const collection = await parseSpotifyCollection(query);
@@ -529,7 +568,6 @@ async function handlePlay(interaction) {
         ],
       });
 
-      // Silently resolve remaining playlist tracks in the background
       (async () => {
         for (const songTitle of collection.songs) {
           try {
@@ -546,7 +584,7 @@ async function handlePlay(interaction) {
     }
   }
 
-  // Handle Single Track (YouTube URL, Spotify Track URL, or Search Query)
+  // Single Track
   let track;
   try {
     track = await resolveTrack(query);
@@ -579,23 +617,50 @@ async function handlePlay(interaction) {
 
 const handlers = {
   play: handlePlay,
+
   async skip(i, gq) {
+    if (!gq.current && gq.queue.length === 0) {
+      return i.editReply('There are no songs in the queue to skip.');
+    }
     gq.forceNext = true;
+    killProc(gq);
     gq.player.stop(true);
-    return i.reply('Skipped to the next track.');
+    return i.editReply('Skipped to the next track.');
   },
+
+  async skipto(i, gq) {
+    if (!gq.queue.length) {
+      return i.editReply('There are no upcoming tracks in the queue to skip to.');
+    }
+    const position = i.options.getInteger('position', true);
+    if (position > gq.queue.length) {
+      return i.editReply(`Invalid position. The queue currently has **${gq.queue.length}** upcoming tracks.`);
+    }
+
+    const skipped = gq.queue.splice(0, position - 1);
+    const target = gq.queue[0];
+    gq.forceNext = true;
+    killProc(gq);
+    gq.player.stop(true);
+
+    return i.editReply(`Skipped **${skipped.length + 1}** track(s). Now playing **${target.title}**.`);
+  },
+
   async pause(i, gq) {
-    return i.reply(gq.player.pause() ? 'Paused playback.' : ephemeral('Nothing is playing to pause.'));
+    return i.editReply(gq.player.pause() ? 'Paused playback.' : 'Nothing is currently playing.');
   },
+
   async resume(i, gq) {
-    return i.reply(gq.player.unpause() ? 'Resumed playback.' : ephemeral('Playback is not paused.'));
+    return i.editReply(gq.player.unpause() ? 'Resumed playback.' : 'Playback is not paused.');
   },
+
   async stop(i, gq) {
     destroyQueue(gq.guildId);
-    return i.reply('Stopped playback, cleared the queue, and disconnected.');
+    return i.editReply('Stopped playback, cleared queue, and disconnected.');
   },
+
   async queue(i, gq) {
-    if (!gq.current && !gq.queue.length) return i.reply(ephemeral('The queue is empty.'));
+    if (!gq.current && !gq.queue.length) return i.editReply('The queue is empty.');
     const lines = gq.queue
       .slice(0, 10)
       .map((t, n) => `**${n + 1}.** [${t.title}](${t.url}) \`${fmtDuration(t.duration)}\``);
@@ -608,12 +673,13 @@ const handlers = {
           (lines.length ? lines.join('\n') + more : 'No tracks queued up next.'),
       )
       .setFooter({ text: `Loop: ${gq.loop} | Volume: ${gq.volume}%` });
-    return i.reply({ embeds: [embed] });
+    return i.editReply({ embeds: [embed] });
   },
+
   async nowplaying(i, gq) {
-    if (!gq.current) return i.reply(ephemeral('Nothing is currently playing.'));
+    if (!gq.current) return i.editReply('Nothing is currently playing.');
     const elapsed = Math.floor((gq.resource?.playbackDuration ?? 0) / 1000);
-    return i.reply({
+    return i.editReply({
       embeds: [
         trackEmbed(
           'Now playing',
@@ -623,27 +689,30 @@ const handlers = {
       ],
     });
   },
+
   async shuffle(i, gq) {
-    if (gq.queue.length < 2) return i.reply(ephemeral('At least 2 songs are needed to shuffle.'));
+    if (gq.queue.length < 2) return i.editReply('At least 2 songs are needed to shuffle.');
     for (let n = gq.queue.length - 1; n > 0; n--) {
       const k = Math.floor(Math.random() * (n + 1));
       [gq.queue[n], gq.queue[k]] = [gq.queue[k], gq.queue[n]];
     }
-    return i.reply('Queue shuffled.');
+    return i.editReply('Queue shuffled.');
   },
+
   async volume(i, gq) {
     gq.volume = i.options.getInteger('level', true);
     gq.resource?.volume?.setVolume(gq.volume / 100);
-    return i.reply(`Volume adjusted to **${gq.volume}%**.`);
+    return i.editReply(`Volume adjusted to **${gq.volume}%**.`);
   },
+
   async loop(i, gq) {
     gq.loop = i.options.getString('mode', true);
-    return i.reply(`Loop mode set to **${gq.loop}**.`);
+    return i.editReply(`Loop mode set to **${gq.loop}**.`);
   },
 };
 
 /* ------------------------------------------------------------------ */
-/* Events                                                             */
+/* Events & Interaction Router                                        */
 /* ------------------------------------------------------------------ */
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
@@ -664,20 +733,27 @@ client.on(Events.InteractionCreate, async (interaction) => {
   const handler = handlers[interaction.commandName];
   if (!handler) return;
 
+  await interaction.deferReply();
+
   try {
-    if (interaction.commandName === 'play') return await handler(interaction);
+    if (interaction.commandName === 'play') {
+      return await handler(interaction);
+    }
 
     const gq = queues.get(interaction.guildId);
-    if (!gq) return interaction.reply(ephemeral('Nothing is currently playing.'));
-    if (interaction.member.voice?.channelId !== gq.channelId) {
-      return interaction.reply(ephemeral('You must be in the same voice channel to use that.'));
+    if (!gq) {
+      return interaction.editReply('Nothing is currently playing.');
     }
+
+    const userVoiceChannelId = interaction.member.voice?.channelId;
+    if (!userVoiceChannelId || userVoiceChannelId !== gq.channelId) {
+      return interaction.editReply('You must be in the same voice channel as the bot to use this.');
+    }
+
     return await handler(interaction, gq);
   } catch (err) {
-    console.error(err);
-    const msg = ephemeral('An unexpected error occurred executing this command.');
-    if (interaction.deferred || interaction.replied) interaction.followUp(msg).catch(() => {});
-    else interaction.reply(msg).catch(() => {});
+    console.error('Error handling interaction:', err);
+    return interaction.editReply('An unexpected error occurred while executing this command.').catch(() => {});
   }
 });
 
