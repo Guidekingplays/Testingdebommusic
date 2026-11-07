@@ -404,11 +404,11 @@ async function createGuildQueue(interaction, voiceChannel) {
 
 function killProc(gq) {
   if (gq.ytProc) {
-    gq.ytProc.kill('SIGKILL');
+    try { gq.ytProc.kill('SIGKILL'); } catch {}
     gq.ytProc = null;
   }
   if (gq.ffmpegProc) {
-    gq.ffmpegProc.kill('SIGKILL');
+    try { gq.ffmpegProc.kill('SIGKILL'); } catch {}
     gq.ffmpegProc = null;
   }
 }
@@ -602,10 +602,16 @@ const handlers = {
     if (!gq.current && gq.queue.length === 0) {
       return i.reply(ephemeral('There are no songs in the queue to skip.'));
     }
+
+    // Immediately defer so Discord acknowledges the command
+    await i.deferReply();
+
     gq.forceNext = true;
     killProc(gq);
     gq.player.stop(true);
-    return i.reply('Skipped to the next track.');
+    playNext(gq, true);
+
+    return i.editReply('Skipped to the next track.');
   },
   async pause(i, gq) {
     return i.reply(gq.player.pause() ? 'Paused playback.' : ephemeral('Nothing is playing to pause.'));
