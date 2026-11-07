@@ -433,7 +433,9 @@ function playNext(gq, announce) {
   if (gq.loop === 'track' && gq.current && !gq.forceNext) {
     next = gq.current;
   } else {
-    if (gq.loop === 'queue' && gq.current) gq.queue.push(gq.current);
+    if (gq.loop === 'queue' && gq.current && !gq.forceNext) {
+      gq.queue.push(gq.current);
+    }
     next = gq.queue.shift();
   }
   gq.forceNext = false;
@@ -597,7 +599,11 @@ async function handlePlay(interaction) {
 const handlers = {
   play: handlePlay,
   async skip(i, gq) {
+    if (!gq.current && gq.queue.length === 0) {
+      return i.reply(ephemeral('There are no songs in the queue to skip.'));
+    }
     gq.forceNext = true;
+    killProc(gq);
     gq.player.stop(true);
     return i.reply('Skipped to the next track.');
   },
