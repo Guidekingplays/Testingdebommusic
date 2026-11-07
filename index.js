@@ -166,6 +166,7 @@ async function createGuildQueue(interaction, voiceChannel) {
   try {
     await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
   } catch (err) {
+    console.error('Voice connection failed (state: %s):', connection.state.status, err);
     connection.destroy();
     throw new Error('Could not join the voice channel.');
   }
